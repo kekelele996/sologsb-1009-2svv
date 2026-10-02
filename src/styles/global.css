@@ -32,8 +32,47 @@ button:focus-visible, a:focus-visible, sl-button:focus-visible, sl-input:focus-v
 .title-block input:hover, .title-block input:focus { background: rgba(255,255,255,.07); border-radius: 5px; }
 .meta { display: flex; gap: 13px; color: #a9c0b8; font-size: 11px; margin-top: 3px; }
 .save-dot::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #77d3a0; margin-right: 5px; }
+.save-dot.status-saving::before { background: #e3b341; animation: pulse 1s ease-in-out infinite; }
+.save-dot.status-error { color: #ffb4ad; }
+.save-dot.status-error::before { background: #ff6b5e; }
+.save-dot.status-warning { color: #ffd991; }
+.save-dot.status-warning::before { background: #e3a23b; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.rev-tag { color: #8fb0a6; font-size: 10px; border: 1px solid rgba(255,255,255,.18); border-radius: 99px; padding: 2px 8px; }
 .top-actions { display: flex; gap: 7px; align-items: center; }
 .online-pill { font-size: 11px; color: #bbebce; background: rgba(255,255,255,.09); border-radius: 99px; padding: 6px 9px; }
+
+.notice-stack { display: grid; gap: 8px; padding: 10px 20px 2px; background: #eef2ef; }
+.notice-banner { border-radius: 10px; padding: 10px 13px; border: 1px solid; display: grid; gap: 7px; }
+.notice-banner.danger { border-color: #e6b5b0; background: #fdf1ef; color: #8c2f27; }
+.notice-banner.warning { border-color: #e8cf9c; background: #fef7e6; color: #7d5412; }
+.notice-banner.info { border-color: #bcd7e8; background: #eef7fc; color: #205478; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.notice-banner.conflict { border-color: #d9b3e2; background: #faf2fd; color: #5e2f73; }
+.notice-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.notice-head b { font-size: 12px; }
+.notice-head span { font-size: 10.5px; color: inherit; opacity: .78; }
+.notice-list { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 11px; }
+.conflict-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.conflict-row { border: 1px solid #e3c6ec; border-radius: 8px; background: #fff; padding: 8px 10px; display: grid; gap: 6px; }
+.conflict-row.term b { font-size: 11px; color: #5e2f73; }
+.conflict-jump { justify-self: start; border: 0; background: transparent; color: #5e2f73; font-weight: 750; font-size: 11px; text-decoration: underline; cursor: pointer; padding: 0; }
+.conflict-versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.conflict-versions > div { border-radius: 6px; padding: 6px 8px; background: #f6f1f8; border-left: 3px solid #9b6bb0; min-width: 0; }
+.conflict-versions > div span { display: block; font-size: 8.5px; font-weight: 800; letter-spacing: .08em; color: #8a6ba0; text-transform: uppercase; }
+.conflict-versions p { margin: 3px 0 0; font-size: 10.5px; line-height: 1.5; color: #3c2f44; white-space: pre-wrap; word-break: break-word; }
+.conflict-versions small { display: block; margin-top: 3px; font-size: 9px; color: #9382a0; }
+.conflict-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.conflict-card { border: 1px solid #d9b3e2; border-left: 4px solid #9b6bb0; border-radius: 10px; padding: 12px 13px; margin-bottom: 12px; background: #fbf5fe; display: grid; gap: 9px; }
+.conflict-card-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.conflict-card-head b { font-size: 12px; color: #5e2f73; }
+.conflict-card-head span { font-size: 10px; color: #8a7094; }
+.conflict-dot { position: absolute; left: 6px; top: 6px; width: 14px; height: 14px; border-radius: 50%; background: #8e4cad; color: #fff; font-size: 9px; font-weight: 800; font-style: normal; display: grid; place-items: center; }
+.term-row.has-conflict { border-color: #d9b3e2; background: #fbf5fe; }
+.term-conflict { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; border-top: 1px dashed #e3c6ec; padding-top: 5px; }
+.term-conflict span { font-size: 10px; color: #5e2f73; flex-basis: 100%; }
+.version-actions { margin: 2px 0 8px; display: flex; }
+.version-actions sl-button { width: 100%; }
+.storage-usage { display: block; margin-top: 8px; color: #8d9791; font-size: 9px; text-align: right; }
 
 .progress-strip { height: 54px; display: grid; grid-template-columns: 190px minmax(220px, 1fr) auto; gap: 18px; align-items: center; padding: 8px 20px; background: #f8f8f4; border-bottom: 1px solid var(--line); }
 .progress-copy { display: flex; align-items: baseline; gap: 7px; }

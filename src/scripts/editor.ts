@@ -20,6 +20,21 @@ interface CommentItem {
   replies: CommentReply[];
 }
 
+interface BlockConflictAlt {
+  /** edit：另一标签页改了同一块；deleted：另一标签页删除了这块 */
+  kind: "edit" | "deleted";
+  source: string;
+  at: string;
+  block?: ContentBlock;
+}
+
+interface TermConflictAlt {
+  kind: "edit" | "deleted";
+  source: string;
+  at: string;
+  term?: GlossaryTerm;
+}
+
 interface ContentBlock {
   id: string;
   type: BlockType;
@@ -32,6 +47,8 @@ interface ContentBlock {
   changeReason: string;
   reviewStatus: ReviewStatus;
   comments: CommentItem[];
+  updatedAt?: string;
+  conflict?: { alt: BlockConflictAlt };
 }
 
 interface GlossaryTerm {
@@ -39,10 +56,43 @@ interface GlossaryTerm {
   source: string;
   preferred: string;
   note: string;
+  updatedAt?: string;
+  conflict?: { alt: TermConflictAlt };
 }
 
 interface VersionSnapshot {
-  id: string;
+  seq: number;
+  label: string;
+  createdAt: string;
+  pinned: boolean;
+  blocks: ContentBlock[];
+  glossary: GlossaryTerm[];
+}
+
+/** meta 中只保留快照索引，快照正文单独存 key，写爆一份不拖垮整章 */
+interface VersionIndexEntry {
+  seq: number;
+  label: string;
+  createdAt: string;
+  pinned: boolean;
+}
+
+interface StoredMeta {
+  schema: 2;
+  rev: number;
+  seq: number;
+  title: string;
+  subject: string;
+  grade: string;
+  updatedAt: string;
+  blockIds: string[];
+  termIds: string[];
+  versions: VersionIndexEntry[];
+}
+
+interface StoredVersion {
+  schema: 2;
+  seq: number;
   label: string;
   createdAt: string;
   blocks: ContentBlock[];
@@ -60,6 +110,28 @@ interface ChapterProject {
   updatedAt: string;
 }
 
+/** 标签页草稿：崩溃/关闭后重开时，靠它把没并进去的改动找回来 */
+interface TabDraft {
+  schema: 2;
+  tabId: string;
+  tabName: string;
+  heartbeat: string;
+  baseRev: number;
+  title: string;
+  titleDirty: boolean;
+  selectedVersionId: string;
+  project: ChapterProject;
+  touchedBlocks: Record<string, string | null>;
+  touchedTerms: Record<string, string | null>;
+}
+
+interface RemoteProject {
+  meta: StoredMeta;
+  blocks: ContentBlock[];
+  glossary: GlossaryTerm[];
+  versions: VersionSnapshot[];
+}
+
 interface AccessibilityIssue {
   id: string;
   blockId: string;
@@ -70,8 +142,42 @@ interface AccessibilityIssue {
   suggestion: string;
 }
 
-const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+interface FailedItem {
+  scope: "block" | "term" | "version" | "meta";
+  id: string;
+  label: string;
+}
+
+type SaveKind = "idle" | "saving" | "error" | "warning";
+
+interface SaveState {
+  kind: SaveKind;
+  label: string;
+  detail: string;
+  failed: FailedItem[];
+  evictedCount: number;
+  mergedText: string;
+  usageText: string;
+}
+
+const LEGACY_STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const PREFIX = "sologsb-1009:v2";
+const META_KEY = `${PREFIX}:meta`;
+const blockKey = (id: string) => `${PREFIX}:block:${id}`;
+const termKey = (id: string) => `${PREFIX}:term:${id}`;
+const versionKey = (seq: number) => `${PREFIX}:version:${seq}`;
+const draftKey = (tabId: string) => `${PREFIX}:draft:${tabId}`;
+const DRAFT_PREFIX = `${PREFIX}:draft:`;
+const MAX_UNPINNED_VERSIONS = 10;
+const DRAFT_STALE_MS = 30_000;
+
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+const nowIso = () => new Date().toISOString();
+const clone = <T>(value: T): T => structuredClone(value);
+
+/* ------------------------------------------------------------------ */
+/* 示例章节                                                            */
+/* ------------------------------------------------------------------ */
 
 function createSeedProject(): ChapterProject {
   const blocks: ContentBlock[] = [
@@ -167,7 +273,7 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
-    updatedAt: new Date().toISOString(),
+    updatedAt: nowIso(),
   };
 }
 
@@ -339,6 +445,15 @@ function severityLabel(severity: Severity) {
   return "一致性提醒";
 }
 
+function blockLabel(block: ContentBlock) {
+  const preview = (block.accessibleText || block.text || "（空块）").replace(/\s+/g, "").slice(0, 14);
+  return `${blockRole(block)}「${preview}」`;
+}
+
+function termLabel(term: GlossaryTerm) {
+  return `术语「${term.source} → ${term.preferred}」`;
+}
+
 function exportHtml(project: ChapterProject) {
   const body = project.blocks.map((block) => {
     if (block.type === "heading") {
@@ -388,68 +503,885 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
-function loadProject(): ChapterProject {
+/* ------------------------------------------------------------------ */
+/* 分块存储层：meta / block / term / version / draft 各写各的 key       */
+/* ------------------------------------------------------------------ */
+
+function readJson<T>(key: string): T | null {
+  const raw = localStorage.getItem(key);
+  if (!raw) return null;
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    return JSON.parse(raw) as T;
   } catch {
-    // Fall back to the bundled sample.
+    return null;
   }
-  return createSeedProject();
 }
+
+function isQuotaError(error: unknown): boolean {
+  const e = error as DOMException | null;
+  return !!e && (e.name === "QuotaExceededError" || e.code === 22 || e.code === 1014);
+}
+
+function listDraftIds(): string[] {
+  const ids: string[] = [];
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i);
+    if (key?.startsWith(DRAFT_PREFIX)) ids.push(key.slice(DRAFT_PREFIX.length));
+  }
+  return ids;
+}
+
+function liveSelectedSeqs(protectSeq: number): Set<number> {
+  // 正在使用的标签页当前正在比较的快照不能被淘汰
+  const seqs = new Set<number>([protectSeq]);
+  for (const id of listDraftIds()) {
+    const draft = readJson<TabDraft>(draftKey(id));
+    if (!draft) continue;
+    const fresh = Date.now() - Date.parse(draft.heartbeat) < DRAFT_STALE_MS;
+    const seq = Number(draft.selectedVersionId);
+    if (fresh && Number.isFinite(seq)) seqs.add(seq);
+  }
+  return seqs;
+}
+
+/** 淘汰上下文：容量不足时按批次删掉最旧、未固定、没人引用的快照 */
+interface EvictContext {
+  versions: VersionIndexEntry[];
+  protected: Set<number>;
+  evicted: VersionIndexEntry[];
+}
+
+function writeWithEviction(key: string, value: string, ctx: EvictContext): void {
+  const batches = [1, 2, 4, 8];
+  let attempt = 0;
+  for (;;) {
+    try {
+      localStorage.setItem(key, value);
+      return;
+    } catch (error) {
+      if (!isQuotaError(error)) throw error;
+      const count = batches[Math.min(attempt, batches.length - 1)];
+      const victims = ctx.versions
+        .filter((entry) => !entry.pinned && !ctx.protected.has(entry.seq))
+        .sort((a, b) => a.seq - b.seq)
+        .slice(0, count);
+      if (!victims.length) throw error;
+      for (const victim of victims) {
+        localStorage.removeItem(versionKey(victim.seq));
+        ctx.versions = ctx.versions.filter((entry) => entry.seq !== victim.seq);
+        ctx.evicted.push(victim);
+      }
+      attempt += 1;
+    }
+  }
+}
+
+function writeJson(key: string, value: unknown, ctx: EvictContext): void {
+  writeWithEviction(key, JSON.stringify(value), ctx);
+}
+
+function readRemoteProject(): RemoteProject | null {
+  const meta = readJson<StoredMeta>(META_KEY);
+  if (!meta || meta.schema !== 2) return null;
+  const blocks = meta.blockIds
+    .map((id) => readJson<ContentBlock>(blockKey(id)))
+    .filter((block): block is ContentBlock => !!block);
+  const glossary = meta.termIds
+    .map((id) => readJson<GlossaryTerm>(termKey(id)))
+    .filter((term): term is GlossaryTerm => !!term);
+  const versions = meta.versions
+    .map((entry) => {
+      const body = readJson<StoredVersion>(versionKey(entry.seq));
+      if (!body) return null;
+      return { ...entry, blocks: body.blocks, glossary: body.glossary } satisfies VersionSnapshot;
+    })
+    .filter((version): version is VersionSnapshot => !!version);
+  return { meta, blocks, glossary, versions };
+}
+
+function bootstrapStorage(project: ChapterProject): RemoteProject {
+  // 首次使用（或存储被清空）：把内存中的章节作为 r1 整块写入
+  const ts = nowIso();
+  const meta: StoredMeta = {
+    schema: 2,
+    rev: 1,
+    seq: project.versions.length,
+    title: project.title,
+    subject: project.subject,
+    grade: project.grade,
+    updatedAt: ts,
+    blockIds: project.blocks.map((block) => block.id),
+    termIds: project.glossary.map((term) => term.id),
+    versions: project.versions.map((version) => ({ seq: version.seq, label: version.label, createdAt: version.createdAt, pinned: version.pinned })),
+  };
+  const ctx: EvictContext = { versions: meta.versions, protected: liveSelectedSeqs(-1), evicted: [] };
+  for (const block of project.blocks) writeJson(blockKey(block.id), block, ctx);
+  for (const term of project.glossary) writeJson(termKey(term.id), term, ctx);
+  for (const version of project.versions) {
+    writeJson(versionKey(version.seq), { schema: 2, seq: version.seq, label: version.label, createdAt: version.createdAt, blocks: version.blocks, glossary: version.glossary }, ctx);
+  }
+  writeJson(META_KEY, meta, ctx);
+  return { meta, blocks: clone(project.blocks), glossary: clone(project.glossary), versions: clone(project.versions) };
+}
+
+function migrateLegacyStorage(): ChapterProject | null {
+  const stored = readJson<{ schema: number; project: ChapterProject }>(LEGACY_STORAGE_KEY);
+  if (!stored || stored.schema !== 1 || !stored.project?.blocks?.length) return null;
+  const legacy = stored.project;
+  const ts = nowIso();
+  legacy.blocks.forEach((block) => { block.updatedAt ??= ts; delete block.conflict; });
+  legacy.glossary.forEach((term) => { term.updatedAt ??= ts; delete term.conflict; });
+  legacy.versions = (legacy.versions ?? []).map((version, index) => ({
+    seq: index + 1,
+    label: version.label || `版本 ${index + 1}`,
+    createdAt: version.createdAt || ts,
+    pinned: false,
+    blocks: version.blocks,
+    glossary: version.glossary,
+  }));
+  return legacy;
+}
+
+/* ------------------------------------------------------------------ */
+/* 修订号 + 按内容块/术语三路合并                                       */
+/* ------------------------------------------------------------------ */
+
+function blockFingerprint(block: ContentBlock): string {
+  return JSON.stringify([
+    block.type,
+    block.text,
+    block.accessibleText,
+    block.headingLevel ?? null,
+    block.imageSrc ?? null,
+    block.imageAlt ?? null,
+    block.linkHref ?? null,
+    block.changeReason,
+    block.reviewStatus,
+    block.comments,
+  ]);
+}
+
+function termFingerprint(term: GlossaryTerm): string {
+  return JSON.stringify([term.source, term.preferred, term.note]);
+}
+
+interface MergeOutcome {
+  project: ChapterProject;
+  conflicts: number;
+  mergedFrom: string[];
+  /** 合并后重新登记的“本标签页动过”基线，供下一轮保存继续追踪 */
+  rebasedBlocks: Record<string, string | null>;
+  rebasedTerms: Record<string, string | null>;
+}
+
+function mergeInto(remote: RemoteProject, drafts: TabDraft[]): MergeOutcome {
+  let blocks = clone(remote.blocks);
+  let glossary = clone(remote.glossary);
+  let title = remote.meta.title;
+  let titleUpdatedAt = Date.parse(remote.meta.updatedAt) || 0;
+  let versions = clone(remote.versions);
+  const mergedFrom: string[] = [];
+  const rebasedBlocks: Record<string, string | null> = {};
+  const rebasedTerms: Record<string, string | null> = {};
+
+  for (const draft of drafts) {
+    const hasChanges = Object.keys(draft.touchedBlocks).length > 0
+      || Object.keys(draft.touchedTerms).length > 0
+      || draft.titleDirty;
+    if (hasChanges) mergedFrom.push(draft.tabName);
+    const source = draft.tabName;
+    const localBlocks = new Map(draft.project.blocks.map((block) => [block.id, block]));
+    const localTerms = new Map(draft.project.glossary.map((term) => [term.id, term]));
+    const nextBlocks: ContentBlock[] = [];
+
+    for (const remoteBlock of blocks) {
+      const local = localBlocks.get(remoteBlock.id);
+      const base = draft.touchedBlocks[remoteBlock.id];
+      const remoteFp = blockFingerprint(remoteBlock);
+      if (local) {
+        const localFp = blockFingerprint(local);
+        if (base === undefined) {
+          nextBlocks.push(remoteBlock); // 本标签页没动过
+        } else if (base === null) {
+          nextBlocks.push(clone(local)); // 同号新建（极少），保留本地
+          rebasedBlocks[local.id] = null;
+        } else if (remoteFp === base) {
+          nextBlocks.push(clone(local)); // 远端没动，本地改动直接并入
+          rebasedBlocks[local.id] = base;
+        } else if (remoteFp === localFp) {
+          nextBlocks.push(remoteBlock); // 两边改完一致
+        } else {
+          // 两边都动过：本地版为主，远端版作为备选，等人挑
+          const merged = clone(local);
+          if (!merged.conflict) {
+            merged.conflict = { alt: { kind: "edit", source, at: nowIso(), block: clone(remoteBlock) } };
+          }
+          nextBlocks.push(merged);
+          rebasedBlocks[local.id] = base;
+        }
+      } else if (typeof base === "string") {
+        // 本标签页删了这块
+        if (remoteFp === base) {
+          // 远端没动，删除生效，不进 nextBlocks
+        } else {
+          // 远端还改过：保留远端版，挂“本标签页要求删除”的备选
+          const kept = clone(remoteBlock);
+          if (!kept.conflict) kept.conflict = { alt: { kind: "deleted", source, at: nowIso() } };
+          nextBlocks.push(kept);
+        }
+      } else {
+        nextBlocks.push(remoteBlock);
+      }
+      localBlocks.delete(remoteBlock.id);
+    }
+    // 本标签页新建的块（远端还没有）追加在末尾
+    for (const local of localBlocks.values()) {
+      const base = draft.touchedBlocks[local.id];
+      nextBlocks.push(clone(local));
+      rebasedBlocks[local.id] = base ?? null;
+    }
+    blocks = nextBlocks;
+
+    const nextTerms: GlossaryTerm[] = [];
+    for (const remoteTerm of glossary) {
+      const local = localTerms.get(remoteTerm.id);
+      const base = draft.touchedTerms[remoteTerm.id];
+      const remoteFp = termFingerprint(remoteTerm);
+      if (local) {
+        const localFp = termFingerprint(local);
+        if (base === undefined) {
+          nextTerms.push(remoteTerm);
+        } else if (base === null) {
+          nextTerms.push(clone(local));
+          rebasedTerms[local.id] = null;
+        } else if (remoteFp === base) {
+          nextTerms.push(clone(local));
+          rebasedTerms[local.id] = base;
+        } else if (remoteFp === localFp) {
+          nextTerms.push(remoteTerm);
+        } else {
+          const merged = clone(local);
+          if (!merged.conflict) {
+            merged.conflict = { alt: { kind: "edit", source, at: nowIso(), term: clone(remoteTerm) } };
+          }
+          nextTerms.push(merged);
+          rebasedTerms[local.id] = base;
+        }
+      } else if (typeof base === "string") {
+        if (remoteFp !== base) {
+          const kept = clone(remoteTerm);
+          if (!kept.conflict) kept.conflict = { alt: { kind: "deleted", source, at: nowIso() } };
+          nextTerms.push(kept);
+        }
+      } else {
+        nextTerms.push(remoteTerm);
+      }
+      localTerms.delete(remoteTerm.id);
+    }
+    for (const local of localTerms.values()) {
+      const base = draft.touchedTerms[local.id];
+      nextTerms.push(clone(local));
+      rebasedTerms[local.id] = base ?? null;
+    }
+    glossary = nextTerms;
+
+    if (draft.titleDirty && draft.title !== title) {
+      const draftTs = Date.parse(draft.project.updatedAt) || 0;
+      if (draftTs >= titleUpdatedAt) {
+        title = draft.title;
+        titleUpdatedAt = draftTs;
+      }
+    }
+
+    // 固定状态是本地偏好，覆盖到远端索引
+    for (const localVersion of draft.project.versions) {
+      const target = versions.find((entry) => entry.seq === localVersion.seq);
+      if (target) target.pinned = localVersion.pinned || target.pinned;
+    }
+  }
+
+  const project: ChapterProject = {
+    id: "accessible-textbook-1009",
+    title,
+    subject: remote.meta.subject,
+    grade: remote.meta.grade,
+    blocks,
+    glossary,
+    versions,
+    updatedAt: nowIso(),
+  };
+  return {
+    project,
+    conflicts: countConflicts(project),
+    mergedFrom: drafts.length ? mergedFrom : [],
+    rebasedBlocks,
+    rebasedTerms,
+  };
+}
+
+function countConflicts(project: ChapterProject): number {
+  return project.blocks.filter((block) => block.conflict).length + project.glossary.filter((term) => term.conflict).length;
+}
+
+/* ------------------------------------------------------------------ */
+/* 应用状态                                                            */
+/* ------------------------------------------------------------------ */
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("Application root was not found");
 const app: HTMLDivElement = rootElement;
 
-let project = loadProject();
-let activeBlockId = project.blocks[0]?.id ?? "";
+function getTabId(): { id: string; name: string } {
+  const stored = sessionStorage.getItem(`${PREFIX}:tab`);
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as { id: string; name: string };
+      if (parsed.id && parsed.name) return parsed;
+    } catch {
+      // fall through and reissue
+    }
+  }
+  const identity = { id: uid("tab"), name: `标签页 ${Math.random().toString(36).slice(2, 6).toUpperCase()}` };
+  sessionStorage.setItem(`${PREFIX}:tab`, JSON.stringify(identity));
+  return identity;
+}
+
+const tab = getTabId();
+
+let project: ChapterProject;
+let baseRev = 1;
+let activeBlockId = "";
 let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
+let touchedBlocks: Record<string, string | null> = {};
+let touchedTerms: Record<string, string | null> = {};
+let titleDirty = false;
+let snapshotRequested = false;
 let saveTimer = 0;
+let draftTimer = 0;
+let retryTimer = 0;
+let autoRetryArmed = false;
+let flushInFlight = false;
+let flushAgain = false;
+
+const saveState: SaveState = {
+  kind: "idle",
+  label: "本地自动保存",
+  detail: "",
+  failed: [],
+  evictedCount: 0,
+  mergedText: "",
+  usageText: "",
+};
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+const isDirty = () => Object.keys(touchedBlocks).length > 0 || Object.keys(touchedTerms).length > 0 || titleDirty;
 
-function saveSoon() {
+/* ------------------------------------------------------------------ */
+/* 启动：迁移 v1 → 回收本标签页草稿 → 并入已关闭标签页的遗留草稿         */
+/* ------------------------------------------------------------------ */
+
+function startup(): void {
+  let remote = readRemoteProject();
+  if (!remote) {
+    const migrated = migrateLegacyStorage();
+    const initial = migrated ?? createSeedProject();
+    try {
+      remote = bootstrapStorage(initial);
+      if (migrated) localStorage.removeItem(LEGACY_STORAGE_KEY);
+    } catch (error) {
+      // 首写就失败也要让界面能用，稍后可重试
+      remote = {
+        meta: { schema: 2, rev: 1, seq: initial.versions.length, title: initial.title, subject: initial.subject, grade: initial.grade, updatedAt: initial.updatedAt, blockIds: initial.blocks.map((b) => b.id), termIds: initial.glossary.map((t) => t.id), versions: [] },
+        blocks: clone(initial.blocks),
+        glossary: clone(initial.glossary),
+        versions: clone(initial.versions),
+      };
+      reportStorageFailure([{ scope: "meta", id: "bootstrap", label: "文档主索引" }], error);
+    }
+  } else {
+    sweepOrphanVersionKeys(remote.meta);
+  }
+
+  baseRev = remote.meta.rev;
+  const ownId = tab.id;
+  const staleDrafts: TabDraft[] = [];
+  let ownDraft: TabDraft | null = null;
+  for (const id of listDraftIds()) {
+    const draft = readJson<TabDraft>(draftKey(id));
+    if (!draft || draft.schema !== 2) continue;
+    if (id === ownId) {
+      ownDraft = draft;
+      continue;
+    }
+    const age = Date.now() - Date.parse(draft.heartbeat);
+    if (age > DRAFT_STALE_MS) staleDrafts.push(draft);
+  }
+  staleDrafts.sort((a, b) => a.heartbeat.localeCompare(b.heartbeat));
+
+  const drafts: TabDraft[] = [];
+  if (ownDraft) drafts.push(ownDraft);
+  drafts.push(...staleDrafts);
+
+  if (drafts.length) {
+    // 自己的草稿永远最后并入（代表本标签页最新状态）
+    drafts.sort((a, b) => (a.tabId === ownId ? 1 : b.tabId === ownId ? -1 : a.heartbeat.localeCompare(b.heartbeat)));
+    const outcome = mergeInto(remote, drafts);
+    project = outcome.project;
+    touchedBlocks = outcome.rebasedBlocks;
+    touchedTerms = outcome.rebasedTerms;
+    titleDirty = drafts.some((draft) => draft.tabId === ownId && draft.titleDirty);
+    const own = drafts.find((draft) => draft.tabId === ownId);
+    if (own) selectedVersionId = own.selectedVersionId;
+    if (outcome.mergedFrom.length) {
+      saveState.mergedText = `已按修订号并入 ${outcome.mergedFrom.length} 份离线修改${outcome.conflicts ? `，${outcome.conflicts} 处冲突待人工选择` : ""}`;
+    }
+  } else {
+    project = {
+      id: "accessible-textbook-1009",
+      title: remote.meta.title,
+      subject: remote.meta.subject,
+      grade: remote.meta.grade,
+      blocks: remote.blocks,
+      glossary: remote.glossary,
+      versions: remote.versions,
+      updatedAt: remote.meta.updatedAt,
+    };
+  }
+
+  activeBlockId = project.blocks[0]?.id ?? "";
+  for (const dead of staleDrafts) localStorage.removeItem(draftKey(dead.tabId));
+  saveState.label = `已保存 · r${baseRev}`;
+  void refreshUsage();
+  render();
+  if (isDirty()) {
+    writeDraft();
+    requestFlush("启动恢复未保存修改");
+  }
+}
+
+function sweepOrphanVersionKeys(meta: StoredMeta): void {
+  const live = new Set(meta.versions.map((entry) => entry.seq));
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith(`${PREFIX}:version:`)) continue;
+    const seq = Number(key.split(":").pop());
+    if (!live.has(seq)) localStorage.removeItem(key);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 保存协调：串行队列 + CAS 重读 + 分块写 + 容量淘汰 + 失败报告          */
+/* ------------------------------------------------------------------ */
+
+function setSaveState(patch: Partial<SaveState>): void {
+  Object.assign(saveState, patch);
+  paintSavePill();
+}
+
+function paintSavePill(): void {
+  const pill = document.querySelector<HTMLElement>("#save-pill");
+  if (!pill) return;
+  pill.className = `save-dot status-${saveState.kind}`;
+  pill.textContent = saveState.label;
+  pill.title = saveState.detail;
+}
+
+function requestFlush(reason: string): void {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
-  }, 320);
+  autoRetryArmed = false;
+  setSaveState({ kind: "saving", label: "保存中…", detail: reason });
+  saveTimer = window.setTimeout(() => { void flush(); }, 320);
+}
+
+async function flush(): Promise<void> {
+  if (flushInFlight) {
+    flushAgain = true;
+    return;
+  }
+  flushInFlight = true;
+  window.clearTimeout(retryTimer);
+  try {
+    do {
+      flushAgain = false;
+      await doFlush();
+    } while (flushAgain);
+  } finally {
+    flushInFlight = false;
+  }
+}
+
+function currentDraft(): TabDraft {
+  return {
+    schema: 2,
+    tabId: tab.id,
+    tabName: tab.name,
+    heartbeat: nowIso(),
+    baseRev,
+    title: project.title,
+    titleDirty,
+    selectedVersionId,
+    project: clone(project),
+    touchedBlocks: clone(touchedBlocks),
+    touchedTerms: clone(touchedTerms),
+  };
+}
+
+function doFlush(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      let remote = readRemoteProject();
+      if (!remote) remote = bootstrapStorage(project);
+
+      // 始终拿最新远端再合并，防止 storage 事件漏掉的竞态；
+      // 同时收养已关闭标签页（心跳超过 30 秒）还没并入的草稿
+      const adopted: TabDraft[] = [];
+      for (const id of listDraftIds()) {
+        if (id === tab.id) continue;
+        const other = readJson<TabDraft>(draftKey(id));
+        if (!other || other.schema !== 2) continue;
+        if (Date.now() - Date.parse(other.heartbeat) <= DRAFT_STALE_MS) continue;
+        adopted.push(other);
+      }
+      adopted.sort((a, b) => a.heartbeat.localeCompare(b.heartbeat));
+      const incomingDrafts = [...adopted, currentDraft()];
+      const outcome = mergeInto(remote, incomingDrafts);
+      let working = outcome.project;
+      touchedBlocks = outcome.rebasedBlocks;
+      touchedTerms = outcome.rebasedTerms;
+      const mergedOthers = outcome.mergedFrom.filter((name) => name !== tab.name).length > 0;
+
+      const failed: FailedItem[] = [];
+      const protectSeq = remote.meta.seq + 1;
+      const ctx: EvictContext = {
+        versions: working.versions.map((version) => ({ seq: version.seq, label: version.label, createdAt: version.createdAt, pinned: version.pinned })),
+        protected: liveSelectedSeqs(protectSeq),
+        evicted: [],
+      };
+
+      // 1) 先写快照正文（独立 key，失败不拖垮正文）
+      let newVersion: VersionSnapshot | null = null;
+      if (snapshotRequested) {
+        snapshotRequested = false;
+        const seq = Math.max(remote.meta.seq, ...working.versions.map((version) => version.seq), 0) + 1;
+        newVersion = { seq, label: `版本 ${seq}`, createdAt: nowIso(), pinned: false, blocks: clone(working.blocks), glossary: clone(working.glossary) };
+        // 常规上限：未固定快照最多保留 10 份，最旧的先让位
+        // （这是策略裁剪而非容量淘汰，不计入对用户的告警）
+        const unPinned = ctx.versions.filter((entry) => !entry.pinned).sort((a, b) => b.seq - a.seq);
+        for (const stale of unPinned.slice(MAX_UNPINNED_VERSIONS - 1)) {
+          localStorage.removeItem(versionKey(stale.seq));
+          ctx.versions = ctx.versions.filter((entry) => entry.seq !== stale.seq);
+        }
+        try {
+          writeJson(versionKey(seq), { schema: 2, ...newVersion }, ctx);
+          ctx.versions.unshift({ seq, label: newVersion.label, createdAt: newVersion.createdAt, pinned: false });
+          working.versions = syncVersionBodies(working.versions, newVersion, ctx.versions);
+        } catch (error) {
+          newVersion = null;
+          failed.push({
+            scope: "version",
+            id: String(seq),
+            label: `新版本快照（${isQuotaError(error) ? "存储空间不足，已无可淘汰快照" : "浏览器拒绝写入"}）`,
+          });
+        }
+      }
+
+      // 2) 分块写内容块；任何一块失败都不提交 meta，避免索引指向空块
+      const remoteBlockById = new Map(remote.blocks.map((block) => [block.id, block]));
+      for (const block of working.blocks) {
+        const old = remoteBlockById.get(block.id);
+        if (old && blockFingerprint(old) === blockFingerprint(block) && !block.conflict) continue;
+        try {
+          writeJson(blockKey(block.id), block, ctx);
+        } catch {
+          failed.push({ scope: "block", id: block.id, label: blockLabel(block) });
+        }
+      }
+      const remoteBlockIds = new Set(remote.blocks.map((block) => block.id));
+      const removedBlockIds = [...remoteBlockIds].filter((id) => !working.blocks.some((block) => block.id === id));
+      for (const id of removedBlockIds) localStorage.removeItem(blockKey(id));
+
+      // 3) 分块写术语
+      const remoteTermById = new Map(remote.glossary.map((term) => [term.id, term]));
+      for (const term of working.glossary) {
+        const old = remoteTermById.get(term.id);
+        if (old && termFingerprint(old) === termFingerprint(term) && !term.conflict) continue;
+        try {
+          writeJson(termKey(term.id), term, ctx);
+        } catch {
+          failed.push({ scope: "term", id: term.id, label: termLabel(term) });
+        }
+      }
+      const remoteTermIds = new Set(remote.glossary.map((term) => term.id));
+      for (const id of [...remoteTermIds].filter((termId) => !working.glossary.some((term) => term.id === termId))) {
+        localStorage.removeItem(termKey(id));
+      }
+
+      const chunkFailures = failed.filter((item) => item.scope !== "version");
+      if (chunkFailures.length) {
+        finishWithFailure(failed, ctx);
+        resolve();
+        return;
+      }
+
+      // 4) 最后写 meta（修订号 +1），它是整个提交的落盘点
+      const nextRev = remote.meta.rev + 1;
+      const meta: StoredMeta = {
+        schema: 2,
+        rev: nextRev,
+        seq: Math.max(remote.meta.seq, ...ctx.versions.map((entry) => entry.seq), 0),
+        title: working.title,
+        subject: working.subject,
+        grade: working.grade,
+        updatedAt: nowIso(),
+        blockIds: working.blocks.map((block) => block.id),
+        termIds: working.glossary.map((term) => term.id),
+        versions: ctx.versions.map((entry) => ({ seq: entry.seq, label: entry.label, createdAt: entry.createdAt, pinned: entry.pinned })),
+      };
+      try {
+        writeJson(META_KEY, meta, ctx);
+      } catch {
+        failed.push({ scope: "meta", id: META_KEY, label: "文档主索引（含修订号与章节目录）" });
+        finishWithFailure(failed, ctx);
+        resolve();
+        return;
+      }
+
+      // 提交成功：基线前移、冲突外的已并入改动清空追踪、草稿删除
+      baseRev = nextRev;
+      project = working;
+      if (newVersion) selectedVersionId = String(newVersion.seq);
+      const liveVersionSeqs = new Set(ctx.versions.map((entry) => entry.seq));
+      project.versions = project.versions.filter((version) => liveVersionSeqs.has(version.seq));
+      for (const entry of ctx.versions) {
+        const existing = project.versions.find((version) => version.seq === entry.seq);
+        if (existing) existing.pinned = entry.pinned;
+      }
+      touchedBlocks = {};
+      touchedTerms = {};
+      titleDirty = false;
+      localStorage.removeItem(draftKey(tab.id));
+      for (const dead of adopted) localStorage.removeItem(draftKey(dead.tabId));
+
+      const evicted = ctx.evicted.length;
+      if (evicted > 0) {
+        setSaveState({
+          kind: "warning",
+          label: `已保存 · r${nextRev}`,
+          detail: `浏览器容量不足，已分批淘汰 ${evicted} 个最旧且未固定、未被比较引用的快照后保存成功。`,
+          failed: [],
+          evictedCount: evicted,
+        });
+      } else if (failed.length) {
+        setSaveState({
+          kind: "warning",
+          label: `正文已保存 · r${nextRev}`,
+          detail: "版本快照写入失败，正文与审核结论已保存。",
+          failed,
+          evictedCount: 0,
+        });
+      } else {
+        setSaveState({
+          kind: "idle",
+          label: `已保存 · r${nextRev}`,
+          detail: mergedOthers ? "已并入其他标签页的修改" : "所有内容块均已写入浏览器",
+          failed: [],
+          evictedCount: 0,
+        });
+      }
+      if (mergedOthers) saveState.mergedText = `检测到其他标签页的新修订（r${remote.meta.rev}），已按内容块并入${countConflicts(project) ? "，冲突块已保留两版" : ""}`;
+      void refreshUsage();
+      render();
+      resolve();
+    } catch (error) {
+      finishWithFailure([{ scope: "meta", id: META_KEY, label: "保存流程异常中断" }], null, error);
+      resolve();
+    }
+  });
+}
+
+function syncVersionBodies(existing: VersionSnapshot[], added: VersionSnapshot, index: VersionIndexEntry[]): VersionSnapshot[] {
+  const seqs = new Set(index.map((entry) => entry.seq));
+  return [added, ...existing.filter((version) => seqs.has(version.seq) && version.seq !== added.seq)];
+}
+
+function finishWithFailure(failed: FailedItem[], ctx: EvictContext | null, error?: unknown): void {
+  const names = failed.map((item) => item.label).join("、");
+  setSaveState({
+    kind: "error",
+    label: "部分内容没保住",
+    detail: `写入失败：${names}。主修订号未前进，改动仍保留在本标签页，可按块重试。${error && !isQuotaError(error) ? `（${String(error)}）` : ""}`,
+    failed,
+    evictedCount: ctx?.evicted.length ?? saveState.evictedCount,
+  });
+  render();
+  window.clearTimeout(retryTimer);
+  // 自动只重试一轮（可能是别的标签页刚腾出空间），之后等人工点“重试”
+  if (!autoRetryArmed) {
+    autoRetryArmed = true;
+    retryTimer = window.setTimeout(() => { void flush(); }, 2000);
+  }
+}
+
+function reportStorageFailure(failed: FailedItem[], error?: unknown): void {
+  finishWithFailure(failed, null, error);
+}
+
+async function refreshUsage(): Promise<void> {
+  try {
+    const estimate = await navigator.storage?.estimate?.();
+    if (estimate?.quota) {
+      const kb = Math.round((estimate.usage ?? 0) / 1024);
+      const mb = (estimate.quota / (1024 * 1024)).toFixed(0);
+      saveState.usageText = `本地存储约 ${kb} KB / ${mb} MB`;
+    }
+  } catch {
+    // estimate is best-effort only
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 标签页草稿：防抖写 + 心跳 + 关闭前同步落盘                            */
+/* ------------------------------------------------------------------ */
+
+function scheduleDraft(): void {
+  window.clearTimeout(draftTimer);
+  draftTimer = window.setTimeout(() => writeDraft(), 250);
+}
+
+function writeDraft(): void {
+  if (!isDirty()) return;
+  try {
+    localStorage.setItem(draftKey(tab.id), JSON.stringify(currentDraft()));
+  } catch {
+    // 草稿写不进去时正文保存仍会重试；只做轻提示
+    if (saveState.kind !== "error") {
+      setSaveState({ kind: "warning", label: "离线缓冲写入失败", detail: "本标签页的临时缓冲写入失败，正文保存会继续重试；请避免直接关闭页面。", failed: [], evictedCount: 0 });
+    }
+  }
+}
+
+window.addEventListener("beforeunload", writeDraft);
+window.addEventListener("pagehide", writeDraft);
+window.setInterval(() => {
+  if (isDirty()) writeDraft();
+}, 4000);
+
+/* 其他标签页写入后，按修订号拉取并块级合并 */
+let pullTimer = 0;
+window.addEventListener("storage", (event) => {
+  if (!event.key || !event.key.startsWith(PREFIX)) return;
+  if (event.key === draftKey(tab.id) || event.key.startsWith(DRAFT_PREFIX)) return;
+  window.clearTimeout(pullTimer);
+  pullTimer = window.setTimeout(() => {
+    const remote = readRemoteProject();
+    if (!remote || remote.meta.rev <= baseRev) return;
+    const incomingRev = remote.meta.rev;
+    const outcome = mergeInto(remote, [currentDraft()]);
+    project = outcome.project;
+    touchedBlocks = outcome.rebasedBlocks;
+    touchedTerms = outcome.rebasedTerms;
+    const hadLocalChanges = isDirty();
+    if (hadLocalChanges) {
+      // 本地有未提交改动：基线保持不变，由接下来的回写在冲突/自动并入后推进
+      saveState.mergedText = `其他标签页已保存到 r${incomingRev}，正与本标签页的修改按块合并${outcome.conflicts ? `，${outcome.conflicts} 处冲突保留两版` : ""}`;
+      void refreshUsage();
+      render();
+      writeDraft();
+      requestFlush("合并其他标签页修订后回写");
+    } else {
+      // 干净快进：基线直接前移到远端修订号
+      baseRev = incomingRev;
+      saveState.mergedText = `其他标签页已保存到 r${incomingRev}，未动过的块已自动更新`;
+      void refreshUsage();
+      render();
+      setSaveState({ kind: "idle", label: `已保存 · r${incomingRev}`, detail: "已同步其他标签页的修订", failed: [], evictedCount: 0 });
+    }
+  }, 250);
+});
+
+/* ------------------------------------------------------------------ */
+/* 编辑动作与撤销重做                                                  */
+/* ------------------------------------------------------------------ */
+
+function recordTouch(before: ChapterProject, after: ChapterProject): void {
+  const beforeBlocks = new Map(before.blocks.map((block) => [block.id, block]));
+  const afterBlocks = new Map(after.blocks.map((block) => [block.id, block]));
+  for (const [id, afterBlock] of afterBlocks) {
+    const beforeBlock = beforeBlocks.get(id);
+    if (!beforeBlock) {
+      touchedBlocks[id] ??= null; // 新建
+      afterBlock.updatedAt = nowIso();
+    } else if (blockFingerprint(beforeBlock) !== blockFingerprint(afterBlock)) {
+      touchedBlocks[id] ??= blockFingerprint(beforeBlock);
+      afterBlock.updatedAt = nowIso();
+    }
+  }
+  for (const id of beforeBlocks.keys()) {
+    if (!afterBlocks.has(id)) touchedBlocks[id] ??= blockFingerprint(beforeBlocks.get(id)!);
+  }
+
+  const beforeTerms = new Map(before.glossary.map((term) => [term.id, term]));
+  const afterTerms = new Map(after.glossary.map((term) => [term.id, term]));
+  for (const [id, afterTerm] of afterTerms) {
+    const beforeTerm = beforeTerms.get(id);
+    if (!beforeTerm) {
+      touchedTerms[id] ??= null;
+      afterTerm.updatedAt = nowIso();
+    } else if (termFingerprint(beforeTerm) !== termFingerprint(afterTerm)) {
+      touchedTerms[id] ??= termFingerprint(beforeTerm);
+      afterTerm.updatedAt = nowIso();
+    }
+  }
+  for (const id of beforeTerms.keys()) {
+    if (!afterTerms.has(id)) touchedTerms[id] ??= termFingerprint(beforeTerms.get(id)!);
+  }
 }
 
 function commit(label: string, update: (draft: ChapterProject) => void, renderAfter = true) {
-  undoStack = [...undoStack.slice(-49), structuredClone(project)];
+  undoStack = [...undoStack.slice(-49), clone(project)];
   redoStack = [];
-  const draft = structuredClone(project);
+  const before = project;
+  const draft = clone(project);
   update(draft);
-  draft.updatedAt = new Date().toISOString();
+  draft.updatedAt = nowIso();
+  recordTouch(before, draft);
   project = draft;
   document.documentElement.dataset.lastAction = label;
-  saveSoon();
+  saveState.mergedText = "";
+  saveState.evictedCount = 0;
+  scheduleDraft();
+  requestFlush(label);
   if (renderAfter) render();
 }
 
 function undo() {
   const previous = undoStack.pop();
   if (!previous) return;
-  redoStack = [structuredClone(project), ...redoStack].slice(0, 50);
+  redoStack = [clone(project), ...redoStack].slice(0, 50);
+  const before = project;
   project = previous;
+  recordTouch(before, project);
   if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
-  saveSoon();
+  scheduleDraft();
+  requestFlush("撤销");
   render();
 }
 
 function redo() {
   const next = redoStack.shift();
   if (!next) return;
-  undoStack = [...undoStack.slice(-49), structuredClone(project)];
+  undoStack = [...undoStack.slice(-49), clone(project)];
+  const before = project;
   project = next;
-  saveSoon();
+  recordTouch(before, project);
+  scheduleDraft();
+  requestFlush("重做");
   render();
 }
 
@@ -460,12 +1392,84 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+function requestSnapshot(label: string) {
+  document.documentElement.dataset.lastAction = label;
+  snapshotRequested = true;
+  void flush();
+}
+
+/* ------------------------------------------------------------------ */
+/* 渲染                                                                */
+/* ------------------------------------------------------------------ */
+
+function renderNotices(): string {
+  const blockConflicts = project.blocks.filter((block) => block.conflict);
+  const termConflicts = project.glossary.filter((term) => term.conflict);
+  const notices: string[] = [];
+
+  if (saveState.failed.some((item) => item.scope !== "version")) {
+    notices.push(`<div class="notice-banner danger">
+      <div class="notice-head"><b>以下内容没保住，修订号未前进</b><span>改动仍保留在本标签页，可按块重试；快照失败不影响正文</span></div>
+      <ul class="notice-list">${saveState.failed.map((item) => `<li>${escapeHtml(item.label)}</li>`).join("")}</ul>
+      <sl-button size="small" variant="danger" data-action="retry-save">重试保存这些块</sl-button>
+    </div>`);
+  } else if (saveState.failed.some((item) => item.scope === "version")) {
+    notices.push(`<div class="notice-banner warning">
+      <div class="notice-head"><b>新版本快照没保住</b><span>正文与审核结论已保存；空间不足且已无可淘汰的旧快照</span></div>
+      <sl-button size="small" variant="warning" data-action="dismiss-notice">知道了</sl-button>
+    </div>`);
+  }
+
+  if (saveState.evictedCount > 0 && saveState.kind !== "error") {
+    notices.push(`<div class="notice-banner warning">
+      <div class="notice-head"><b>容量不足，已淘汰 ${saveState.evictedCount} 个最旧快照</b><span>被淘汰的均为未固定、且没有标签页正在比较引用的快照</span></div>
+      <sl-button size="small" variant="default" data-action="dismiss-notice">知道了</sl-button>
+    </div>`);
+  }
+
+  if (blockConflicts.length || termConflicts.length) {
+    const rows = [
+      ...blockConflicts.map((block) => {
+        const alt = block.conflict!.alt;
+        const otherText = alt.kind === "deleted"
+          ? "（对方删除了这块）"
+          : escapeHtml(alt.block!.accessibleText || alt.block!.text || "（空）");
+        return `<li class="conflict-row">
+          <button class="conflict-jump" data-action="select-block" data-block-id="${block.id}">${escapeHtml(blockLabel(block))}</button>
+          <div class="conflict-versions"><div><span>本标签页</span><p>${escapeHtml(block.accessibleText || block.text || "（空）")}</p></div><div><span>${escapeHtml(alt.source)} · r前</span><p>${otherText}</p></div></div>
+          <div class="conflict-actions"><sl-button size="small" variant="primary" data-action="resolve-block" data-block-id="${block.id}" data-choice="mine">保留本页版</sl-button><sl-button size="small" data-action="resolve-block" data-block-id="${block.id}" data-choice="other">${alt.kind === "deleted" ? "同意删除" : "采用对方版"}</sl-button></div>
+        </li>`;
+      }),
+      ...termConflicts.map((term) => {
+        const alt = term.conflict!.alt;
+        const otherText = alt.kind === "deleted" ? "（对方删除了这条术语）" : escapeHtml(`${alt.term!.source} → ${alt.term!.preferred}`);
+        return `<li class="conflict-row term">
+          <b>${escapeHtml(termLabel(term))}</b>
+          <div class="conflict-versions"><div><span>本标签页</span><p>${escapeHtml(`${term.source} → ${term.preferred}`)}</p></div><div><span>${escapeHtml(alt.source)}</span><p>${otherText}</p></div></div>
+          <div class="conflict-actions"><sl-button size="small" variant="primary" data-action="resolve-term" data-term-id="${term.id}" data-choice="mine">保留本页版</sl-button><sl-button size="small" data-action="resolve-term" data-term-id="${term.id}" data-choice="other">${alt.kind === "deleted" ? "同意删除" : "采用对方版"}</sl-button></div>
+        </li>`;
+      }),
+    ].join("");
+    notices.push(`<div class="notice-banner conflict">
+      <div class="notice-head"><b>${blockConflicts.length + termConflicts.length} 处冲突已保留两版，等待人工选择</b><span>同一内容块被两个标签页改动；选定前两版都不会丢</span></div>
+      <ul class="conflict-list">${rows}</ul>
+    </div>`);
+  }
+
+  if (saveState.mergedText) {
+    notices.push(`<div class="notice-banner info"><b>${escapeHtml(saveState.mergedText)}</b><sl-button size="small" variant="text" data-action="dismiss-notice">关闭</sl-button></div>`);
+  }
+
+  return notices.length ? `<div class="notice-stack">${notices.join("")}</div>` : "";
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
-  const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const version = project.versions.find((item) => String(item.seq) === selectedVersionId) ?? project.versions[0];
+  const conflictCount = countConflicts(project);
 
   app.innerHTML = `
     <div class="app-shell">
@@ -473,7 +1477,7 @@ function render() {
         <div class="brand"><span>无障碍</span><b>1009</b></div>
         <div class="title-block">
           <input id="project-title" aria-label="教材名称" value="${escapeHtml(project.title)}" />
-          <div class="meta"><span>${escapeHtml(project.subject)}</span><span>${escapeHtml(project.grade)}</span><span class="save-dot">本地自动保存</span></div>
+          <div class="meta"><span>${escapeHtml(project.subject)}</span><span>${escapeHtml(project.grade)}</span><span id="save-pill" class="save-dot status-${saveState.kind}" title="${escapeHtml(saveState.detail)}">${escapeHtml(saveState.label)}</span><span class="rev-tag">修订号 r${baseRev}${conflictCount ? ` · ${conflictCount} 处冲突` : ""}</span></div>
         </div>
         <div class="top-actions">
           <span class="online-pill">${navigator.onLine ? "在线" : "离线可编辑"}</span>
@@ -495,6 +1499,8 @@ function render() {
         </div>
       </div>
 
+      ${renderNotices()}
+
       <div class="workspace">
         <aside class="outline-panel">
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
@@ -505,6 +1511,7 @@ function render() {
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
+                ${block.conflict ? `<b class="conflict-dot" title="冲突待选择">!</b>` : ""}
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
@@ -522,6 +1529,8 @@ function render() {
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
           </div>
+
+          ${active.conflict ? renderBlockConflict(active) : ""}
 
           ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
             <div class="issue-card ${issue.severity}">
@@ -580,27 +1589,54 @@ function render() {
           </section>
 
           <section class="version-card">
-            <div class="section-heading"><div><span class="eyebrow">Version compare</span><h2>版本比较</h2></div><sl-badge>${project.versions.length} 版</sl-badge></div>
+            <div class="section-heading"><div><span class="eyebrow">Version compare</span><h2>版本比较</h2></div><sl-badge>${project.versions.length} 版${project.versions.filter((item) => item.pinned).length ? ` · ${project.versions.filter((item) => item.pinned).length} 固定` : ""}</sl-badge></div>
             ${project.versions.length ? `
-              <sl-select id="version-select" size="small" value="${version?.id ?? ""}">${project.versions.map((item) => `<sl-option value="${item.id}">${escapeHtml(item.label)} · ${new Date(item.createdAt).toLocaleTimeString()}</sl-option>`).join("")}</sl-select>
+              <sl-select id="version-select" size="small" value="${String(version?.seq ?? "")}">${project.versions.map((item) => `<sl-option value="${item.seq}">${item.pinned ? "★ " : ""}${escapeHtml(item.label)} · ${new Date(item.createdAt).toLocaleTimeString()}</sl-option>`).join("")}</sl-select>
+              <div class="version-actions">
+                <sl-button size="small" variant="${version?.pinned ? "warning" : "default"}" outline data-action="toggle-pin" ${version ? "" : "disabled"}>${version?.pinned ? "★ 已固定（不参与淘汰）" : "☆ 固定此版本"}</sl-button>
+              </div>
               <div class="version-diff">${version ? renderVersionDiff(version, active) : ""}</div>
-            ` : `<div class="empty-note">保存版本后，可比较改写前后的无障碍文本。</div>`}
+              <small class="storage-usage">${escapeHtml(saveState.usageText || "正在估算本地存储用量…")}</small>
+            ` : `<div class="empty-note">保存版本后，可比较改写前后的无障碍文本。未固定快照最多保留 10 份，容量不足时优先淘汰最旧且无人引用的。</div>`}
           </section>
         </aside>
       </div>
 
-      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
+      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>修订号 r${baseRev} · ${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
     </div>
 
     <sl-dialog label="全书术语表" ${showGlossary ? "open" : ""} data-dialog="glossary">
       <div class="glossary-editor">
-        ${project.glossary.map((term) => `<div class="term-row"><div><b>${escapeHtml(term.source)}</b><sl-input size="small" value="${escapeHtml(term.preferred)}" data-term-id="${term.id}"></sl-input><small>${escapeHtml(term.note)}</small></div><sl-button size="small" variant="danger" outline data-action="remove-term" data-term-id="${term.id}">删除</sl-button></div>`).join("")}
+        ${project.glossary.map((term) => `<div class="term-row ${term.conflict ? "has-conflict" : ""}">
+          <div><b>${escapeHtml(term.source)}</b><sl-input size="small" value="${escapeHtml(term.preferred)}" data-term-id="${term.id}"></sl-input><small>${escapeHtml(term.note)}</small>
+          ${term.conflict ? `<div class="term-conflict">
+            <span>与 ${escapeHtml(term.conflict.alt.source)} 的修改冲突：${term.conflict.alt.kind === "deleted" ? "对方删除了该术语" : escapeHtml(`对方为「${term.conflict.alt.term!.source} → ${term.conflict.alt.term!.preferred}」`)}</span>
+            <sl-button size="small" variant="primary" data-action="resolve-term" data-term-id="${term.id}" data-choice="mine">保留本页</sl-button>
+            <sl-button size="small" data-action="resolve-term" data-term-id="${term.id}" data-choice="other">${term.conflict.alt.kind === "deleted" ? "同意删除" : "采用对方"}</sl-button>
+          </div>` : ""}
+          </div><sl-button size="small" variant="danger" outline data-action="remove-term" data-term-id="${term.id}">删除</sl-button></div>`).join("")}
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
     </sl-dialog>`;
 
   wireLiveFields();
+  paintSavePill();
+}
+
+function renderBlockConflict(block: ContentBlock) {
+  const alt = block.conflict!.alt;
+  return `<div class="conflict-card">
+    <div class="conflict-card-head"><b>⚠ 这块和 ${escapeHtml(alt.source)} 的保存撞车了</b><span>两版都保留着，选完才会继续</span></div>
+    <div class="conflict-versions">
+      <div class="mine"><span>本标签页</span><p>${escapeHtml(block.accessibleText || block.text || "（空）")}</p><small>审核：${statusLabel(block.reviewStatus)} · 批注 ${block.comments.length} 条</small></div>
+      <div class="other"><span>${escapeHtml(alt.source)}</span><p>${alt.kind === "deleted" ? "对方删除了这块" : escapeHtml(alt.block!.accessibleText || alt.block!.text || "（空）")}</p>${alt.kind === "edit" && alt.block ? `<small>审核：${statusLabel(alt.block.reviewStatus)} · 批注 ${alt.block.comments.length} 条</small>` : ""}</div>
+    </div>
+    <div class="conflict-actions">
+      <sl-button size="small" variant="primary" data-action="resolve-block" data-block-id="${block.id}" data-choice="mine">保留本页版</sl-button>
+      <sl-button size="small" data-action="resolve-block" data-block-id="${block.id}" data-choice="other">${alt.kind === "deleted" ? "同意删除" : "采用对方版"}</sl-button>
+    </div>
+  </div>`;
 }
 
 function renderSourceEditor(block: ContentBlock) {
@@ -645,7 +1681,7 @@ function renderPreview() {
 function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   const oldBlock = version.blocks.find((block) => block.id === current.id);
   if (!oldBlock) return `<div class="empty-note">当前内容块不在该版本中。</div>`;
-  return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
+  return `<div class="diff-column"><span>旧版 r${version.seq}</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
 
 function wireLiveFields() {
@@ -672,8 +1708,15 @@ function wireLiveFields() {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* 事件                                                                */
+/* ------------------------------------------------------------------ */
+
 app.addEventListener("click", (event) => {
-  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
+  const eventTarget = event.target as HTMLElement | null;
+  const target = eventTarget && typeof eventTarget.closest === "function"
+    ? eventTarget.closest<HTMLElement>("[data-action]")
+    : null;
   if (!target) return;
   const action = target.dataset.action;
   if (action === "undo") undo();
@@ -707,7 +1750,7 @@ app.addEventListener("click", (event) => {
     const input = app.querySelector<HTMLElement & { value: string }>("#new-comment");
     const body = input?.value.trim();
     if (body) updateActiveBlock((block) => {
-      block.comments.unshift({ id: uid("comment"), author: "当前编辑", body, createdAt: new Date().toISOString(), resolved: false, replies: [] });
+      block.comments.unshift({ id: uid("comment"), author: "当前编辑", body, createdAt: nowIso(), resolved: false, replies: [] });
     }, "添加批注");
   }
   if (action === "reply") {
@@ -715,7 +1758,7 @@ app.addEventListener("click", (event) => {
     const input = app.querySelector<HTMLElement & { value: string }>(`#reply-${CSS.escape(commentId)}`);
     const body = input?.value.trim();
     if (body) updateActiveBlock((block) => {
-      block.comments.find((comment) => comment.id === commentId)?.replies.push({ id: uid("reply"), author: "当前编辑", body, createdAt: new Date().toISOString() });
+      block.comments.find((comment) => comment.id === commentId)?.replies.push({ id: uid("reply"), author: "当前编辑", body, createdAt: nowIso() });
     }, "回复批注");
   }
   if (action === "resolve-comment") {
@@ -740,14 +1783,68 @@ app.addEventListener("click", (event) => {
     const termId = target.dataset.termId;
     commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
   }
-  if (action === "save-version") {
-    const versionId = uid("version");
-    commit("保存版本快照", (draft) => {
-      draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) });
-      draft.versions = draft.versions.slice(0, 10);
+  if (action === "save-version") requestSnapshot("保存版本快照");
+  if (action === "toggle-pin") {
+    const seq = Number(selectedVersionId);
+    commit("固定/取消固定版本", (draft) => {
+      const item = draft.versions.find((version) => version.seq === seq);
+      if (item) item.pinned = !item.pinned;
     });
-    selectedVersionId = versionId;
+  }
+  if (action === "retry-save") { void flush(); }
+  if (action === "dismiss-notice") {
+    // 仅关闭提示类横幅；写失败的红条必须保留，直到重试成功
+    saveState.evictedCount = 0;
+    saveState.mergedText = "";
+    saveState.failed = saveState.failed.filter((item) => item.scope === "version");
+    if (!saveState.failed.length) {
+      setSaveState({ kind: "idle", label: `已保存 · r${baseRev}`, detail: "", failed: [], evictedCount: 0 });
+    }
     render();
+  }
+  if (action === "resolve-block") {
+    const blockId = target.dataset.blockId ?? "";
+    const choice = target.dataset.choice;
+    commit("解决内容块冲突", (draft) => {
+      const index = draft.blocks.findIndex((block) => block.id === blockId);
+      if (index < 0) return;
+      const block = draft.blocks[index];
+      const alt = block.conflict?.alt;
+      if (!alt) return;
+      if (choice === "other") {
+        if (alt.kind === "deleted") {
+          draft.blocks.splice(index, 1);
+        } else if (alt.block) {
+          const replacement = clone(alt.block);
+          delete replacement.conflict;
+          draft.blocks[index] = replacement;
+        }
+      } else {
+        delete block.conflict;
+      }
+    });
+  }
+  if (action === "resolve-term") {
+    const termId = target.dataset.termId ?? "";
+    const choice = target.dataset.choice;
+    commit("解决术语冲突", (draft) => {
+      const index = draft.glossary.findIndex((term) => term.id === termId);
+      if (index < 0) return;
+      const term = draft.glossary[index];
+      const alt = term.conflict?.alt;
+      if (!alt) return;
+      if (choice === "other") {
+        if (alt.kind === "deleted") {
+          draft.glossary.splice(index, 1);
+        } else if (alt.term) {
+          const replacement = clone(alt.term);
+          delete replacement.conflict;
+          draft.glossary[index] = replacement;
+        }
+      } else {
+        delete term.conflict;
+      }
+    });
   }
   if (action === "approve-all") {
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
@@ -769,10 +1866,11 @@ app.addEventListener("sl-change", (event) => {
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
+    scheduleDraft();
     render();
   }
-  if (element.matches("[data-term-id]")) {
-    const termId = element.dataset.termId;
+  if (typeof element.matches === "function" && element.matches("[data-term-id]") && element.closest(".term-row")) {
+    const termId = element.dataset.termId!;
     const value = (element as HTMLElement & { value: string }).value;
     commit("修改术语表", (draft) => { const term = draft.glossary.find((item) => item.id === termId); if (term) term.preferred = value; });
   }
@@ -794,15 +1892,18 @@ app.addEventListener("input", (event) => {
   const input = event.target as HTMLInputElement;
   if (input.id === "project-title") {
     project.title = input.value;
-    saveSoon();
+    titleDirty = true;
+    saveState.mergedText = "";
+    scheduleDraft();
+    requestFlush("修改教材名称");
   }
 });
 
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
 window.addEventListener("keydown", (event) => {
-  const target = event.target as HTMLElement;
-  if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
+  const target = event.target as HTMLElement | null;
+  if (target && typeof target.matches === "function" && target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
   const command = event.metaKey || event.ctrlKey;
   if (command && event.key.toLowerCase() === "z") {
     event.preventDefault();
@@ -811,9 +1912,7 @@ window.addEventListener("keydown", (event) => {
   }
   if (command && event.key.toLowerCase() === "s") {
     event.preventDefault();
-    const versionId = uid("version");
-    commit("键盘保存版本", (draft) => { draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) }); });
-    selectedVersionId = versionId;
+    requestSnapshot("键盘保存版本");
     return;
   }
   if (event.key.toLowerCase() === "j" || event.key.toLowerCase() === "k") {
@@ -833,4 +1932,4 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "2") { previewMode = "assisted"; render(); }
 });
 
-render();
+startup();
