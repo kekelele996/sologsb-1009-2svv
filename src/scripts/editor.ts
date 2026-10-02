@@ -1,77 +1,33 @@
 import "@shoelace-style/shoelace/dist/shoelace.js";
-
-type BlockType = "heading" | "paragraph" | "image" | "link";
-type ReviewStatus = "pending" | "approved" | "needs-work";
-type Severity = "error" | "warning" | "info";
-
-interface CommentReply {
-  id: string;
-  author: string;
-  body: string;
-  createdAt: string;
-}
-
-interface CommentItem {
-  id: string;
-  author: string;
-  body: string;
-  createdAt: string;
-  resolved: boolean;
-  replies: CommentReply[];
-}
-
-interface ContentBlock {
-  id: string;
-  type: BlockType;
-  text: string;
-  accessibleText: string;
-  headingLevel?: number;
-  imageSrc?: string;
-  imageAlt?: string;
-  linkHref?: string;
-  changeReason: string;
-  reviewStatus: ReviewStatus;
-  comments: CommentItem[];
-}
-
-interface GlossaryTerm {
-  id: string;
-  source: string;
-  preferred: string;
-  note: string;
-}
-
-interface VersionSnapshot {
-  id: string;
-  label: string;
-  createdAt: string;
-  blocks: ContentBlock[];
-  glossary: GlossaryTerm[];
-}
-
-interface ChapterProject {
-  id: string;
-  title: string;
-  subject: string;
-  grade: string;
-  blocks: ContentBlock[];
-  glossary: GlossaryTerm[];
-  versions: VersionSnapshot[];
-  updatedAt: string;
-}
-
-interface AccessibilityIssue {
-  id: string;
-  blockId: string;
-  type: "heading" | "link" | "image" | "glossary" | "sentence";
-  severity: Severity;
-  title: string;
-  detail: string;
-  suggestion: string;
-}
-
-const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
-const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+import type {
+  AccessibilityIssue,
+  BlockType,
+  ChapterProject,
+  ContentBlock,
+  GlossaryTerm,
+  ReviewStatus,
+  Severity,
+  VersionSnapshot,
+} from "./types.ts";
+import {
+  MAX_RECOVERY_SNAPSHOTS,
+  MAX_VERSIONS,
+  uid,
+  estimateUsage,
+  loadSnapshotData,
+  loadState,
+  mergeThreeWay,
+  newClientId,
+  persistProject,
+  readBlock,
+  readMeta,
+  reconstructProject,
+  removeSnapshot,
+  writeSnapshotData,
+  type ConflictInfo,
+  type SaveReport,
+  type SnapshotMeta,
+} from "./storage.ts";
 
 function createSeedProject(): ChapterProject {
   const blocks: ContentBlock[] = [
@@ -388,21 +344,72 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
-function loadProject(): ChapterProject {
-  try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
-  } catch {
-    // Fall back to the bundled sample.
+function initProject(): ChapterProject {
+  const loaded = loadState();
+  if (loaded) {
+    baseRevision = loaded.revision;
+    baseProject = structuredClone(loaded.project);
+    clientId = loaded.clientId || newClientId();
+    snapshotIndex = readMeta()?.snapshots ?? [];
+    syncVersionsFromIndex();
+    return loaded.project;
   }
-  return createSeedProject();
+  const seed = createSeedProject();
+  baseRevision = 0;
+  baseProject = structuredClone(seed);
+  clientId = newClientId();
+  snapshotIndex = [];
+  return seed;
+}
+
+/** 把快照索引同步成界面用的版本列表（仅元数据，完整数据按需读取）。 */
+function syncVersionsFromIndex() {
+  project.versions = snapshotIndex
+    .filter((snapshot) => snapshot.kind === "version" && snapshot.referenced)
+    .map((snapshot) => ({ id: snapshot.id, label: snapshot.label, createdAt: snapshot.createdAt, blocks: [], glossary: [] }));
+}
+
+/** 淘汰最旧的版本快照（有引用），用于版本数上限。 */
+function evictOldestVersionSnapshot() {
+  const versions = snapshotIndex.filter((snapshot) => snapshot.kind === "version");
+  if (!versions.length) return;
+  const oldest = [...versions].sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+  removeSnapshot(oldest.id);
+  snapshotIndex = snapshotIndex.filter((snapshot) => snapshot.id !== oldest.id);
+  lastEvictedVersionLabels.push(oldest.label);
+}
+
+/** 节流创建无引用的恢复快照，容量不足时会被优先淘汰。 */
+let lastRecoveryAt = 0;
+function maybeCreateRecoverySnapshot() {
+  const now = Date.now();
+  if (now - lastRecoveryAt < 60_000) return;
+  lastRecoveryAt = now;
+  const id = uid("snap");
+  snapshotIndex.unshift({
+    id,
+    label: `恢复快照 ${new Date(now).toLocaleTimeString()}`,
+    createdAt: new Date(now).toISOString(),
+    revision: baseRevision,
+    kind: "recovery",
+    referenced: false,
+  });
+  while (snapshotIndex.filter((snapshot) => snapshot.kind === "recovery").length > MAX_RECOVERY_SNAPSHOTS) {
+    const oldest = snapshotIndex.filter((snapshot) => snapshot.kind === "recovery").sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    removeSnapshot(oldest.id);
+    snapshotIndex = snapshotIndex.filter((snapshot) => snapshot.id !== oldest.id);
+  }
+  const result = writeSnapshotData(id, { blocks: structuredClone(project.blocks), glossary: structuredClone(project.glossary) }, snapshotIndex);
+  if (!result.ok) {
+    snapshotIndex = snapshotIndex.filter((snapshot) => snapshot.id !== id);
+  }
 }
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("Application root was not found");
 const app: HTMLDivElement = rootElement;
 
-let project = loadProject();
+let project = initProject();
 let activeBlockId = project.blocks[0]?.id ?? "";
 let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
@@ -412,14 +419,170 @@ let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
 
+// 多标签页并发保存所需的同步状态
+let clientId = "";
+let baseRevision = 0;
+let baseProject: ChapterProject | null = null;
+let snapshotIndex: SnapshotMeta[] = [];
+let saveStatus: "idle" | "saving" | "saved" | "error" = "idle";
+let lastSaveReport: SaveReport | null = null;
+let conflictNotices: ConflictInfo[] = [];
+let lastEvictedVersionLabels: string[] = [];
+let storageUsage = estimateUsage();
+
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+
+/**
+ * 保存：带修订号。若其他标签页已写入更高修订，则做三向合并，
+ * 按内容块和术语逐条并入本标签页动过的部分，冲突块保留两版。
+ */
+function saveNow() {
+  saveStatus = "saving";
+  const meta = readMeta();
+  const storedRevision = meta?.revision ?? 0;
+  const theirs = meta && storedRevision > baseRevision ? reconstructProject(meta) : null;
+
+  let projectToSave = project;
+  let mergedConflicts: ConflictInfo[] = [];
+  let didMerge = false;
+  if (theirs && baseProject) {
+    const result = mergeThreeWay(baseProject, project, theirs);
+    projectToSave = result.project;
+    mergedConflicts = result.conflicts;
+    project = projectToSave;
+    didMerge = true;
+  }
+
+  const newRevision = storedRevision + 1;
+  const labelMap = new Map(snapshotIndex.map((snapshot) => [snapshot.id, snapshot.label]));
+  const report = persistProject(projectToSave, newRevision, clientId, snapshotIndex);
+  lastSaveReport = report;
+  lastEvictedVersionLabels = report.evictedReferenced
+    .map((id) => labelMap.get(id))
+    .filter((label): label is string => Boolean(label));
+
+  if (report.ok) {
+    baseRevision = newRevision;
+    baseProject = structuredClone(projectToSave);
+    // 没保住的块：把同步基线回退到磁盘上的旧版，下次保存会重新合并并重试
+    for (const id of report.failedBlocks) {
+      const storedBlock = readBlock(id);
+      const index = baseProject.blocks.findIndex((block) => block.id === id);
+      if (index >= 0) {
+        if (storedBlock) baseProject.blocks[index] = structuredClone(storedBlock);
+        else baseProject.blocks.splice(index, 1);
+      }
+    }
+    if (didMerge) {
+      conflictNotices = [...mergedConflicts, ...conflictNotices].slice(0, 30);
+    }
+    maybeCreateRecoverySnapshot();
+    saveStatus = "saved";
+  } else {
+    saveStatus = "error";
+  }
+  storageUsage = estimateUsage();
+  syncVersionsFromIndex();
+  render();
+}
 
 function saveSoon() {
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
+    saveNow();
   }, 320);
+}
+
+/** 其他标签页写入后触发：若修订号更新则并入对方改动。 */
+function mergeFromOtherTab() {
+  const meta = readMeta();
+  if (!meta || meta.revision <= baseRevision) return;
+  const theirs = reconstructProject(meta);
+  if (!baseProject) {
+    baseProject = structuredClone(theirs);
+    baseRevision = meta.revision;
+    project = theirs;
+    render();
+    return;
+  }
+  const result = mergeThreeWay(baseProject, project, theirs);
+  project = result.project;
+  baseProject = structuredClone(result.project);
+  baseRevision = meta.revision;
+  conflictNotices = [...result.conflicts, ...conflictNotices].slice(0, 30);
+  storageUsage = estimateUsage();
+  syncVersionsFromIndex();
+  render();
+}
+
+/** 保存一个有引用的版本快照（完整版数据写入独立键，容量不足时淘汰旧快照）。 */
+function saveVersionSnapshot() {
+  const versionId = uid("version");
+  const label = `版本 ${snapshotIndex.filter((s) => s.kind === "version").length + 1}`;
+  snapshotIndex.unshift({
+    id: versionId,
+    label,
+    createdAt: new Date().toISOString(),
+    revision: baseRevision,
+    kind: "version",
+    referenced: true,
+  });
+  while (snapshotIndex.filter((s) => s.kind === "version").length > MAX_VERSIONS) {
+    evictOldestVersionSnapshot();
+  }
+  const result = writeSnapshotData(
+    versionId,
+    { blocks: structuredClone(project.blocks), glossary: structuredClone(project.glossary) },
+    snapshotIndex,
+  );
+  if (!result.ok) {
+    snapshotIndex = snapshotIndex.filter((s) => s.id !== versionId);
+    lastSaveReport = {
+      ok: false,
+      revision: baseRevision,
+      failedBlocks: [],
+      evicted: result.evicted.map((s) => s.id),
+      evictedReferenced: result.evicted.filter((s) => s.referenced).map((s) => s.id),
+      error: "存储空间不足，版本快照写入失败",
+    };
+  } else {
+    lastEvictedVersionLabels = result.evicted.filter((s) => s.referenced).map((s) => s.label);
+  }
+  selectedVersionId = versionId;
+  syncVersionsFromIndex();
+  saveNow();
+}
+
+/** 解决块冲突：保留某一版，删除另一版，并清除冲突标记。 */
+function resolveConflict(group: string, side: "mine" | "theirs") {
+  const blocks = project.blocks;
+  const mine = blocks.find((block) => block.id === group && block.conflict?.side === "mine");
+  const theirs = blocks.find((block) => block.conflict?.group === group && block.conflict?.side === "theirs");
+  if (!mine || !theirs) {
+    clearConflict(group);
+    return;
+  }
+  const keep = side === "mine" ? mine : theirs;
+  const remove = side === "mine" ? theirs : mine;
+  const index = blocks.findIndex((block) => block.id === remove.id);
+  if (index >= 0) blocks.splice(index, 1);
+  delete keep.conflict;
+  conflictNotices = conflictNotices.filter((notice) => notice.group !== group);
+  commit("解决块冲突", () => {}, false);
+  saveSoon();
+  render();
+}
+
+/** 保留两版：只清除冲突标记。 */
+function clearConflict(group: string) {
+  for (const block of project.blocks) {
+    if (block.conflict?.group === group) delete block.conflict;
+  }
+  conflictNotices = conflictNotices.filter((notice) => notice.group !== group);
+  commit("保留冲突两版", () => {}, false);
+  saveSoon();
+  render();
 }
 
 function commit(label: string, update: (draft: ChapterProject) => void, renderAfter = true) {
@@ -460,6 +623,73 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+function saveLabel(): string {
+  if (saveStatus === "saving") return "保存中…";
+  if (saveStatus === "error") return "保存失败";
+  return "已保存到本浏览器";
+}
+
+/** 冲突与容量警告横幅。 */
+function renderBanners(): string {
+  const banners: string[] = [];
+
+  // 块冲突：两版并排等人挑
+  const blockConflicts = conflictNotices.filter((notice) => notice.kind === "block");
+  if (blockConflicts.length) {
+    banners.push(`
+      <div class="banner conflict-banner">
+        <div class="banner-head"><strong>检测到 ${blockConflicts.length} 个内容块在其他标签页也被修改</strong><span>已保留两版，请挑选要保留的版本</span></div>
+        ${blockConflicts.map((notice) => {
+          const mine = project.blocks.find((block) => block.id === notice.group && block.conflict?.side === "mine");
+          const theirs = project.blocks.find((block) => block.conflict?.group === notice.group && block.conflict?.side === "theirs");
+          if (!mine || !theirs) return "";
+          return `<div class="conflict-pair">
+            <div class="conflict-version mine">
+              <header><sl-badge variant="primary">我的版本</sl-badge><span>${escapeHtml(notice.field)} 两边都改了</span></header>
+              <p>${escapeHtml(mine.accessibleText || mine.text)}</p>
+              <div class="conflict-actions"><sl-button size="small" variant="primary" data-action="keep-mine" data-conflict-group="${notice.group}">采用我的</sl-button></div>
+            </div>
+            <div class="conflict-version theirs">
+              <header><sl-badge variant="warning">另一标签页</sl-badge><span>${escapeHtml(notice.field)} 两边都改了</span></header>
+              <p>${escapeHtml(theirs.accessibleText || theirs.text)}</p>
+              <div class="conflict-actions"><sl-button size="small" variant="default" data-action="keep-theirs" data-conflict-group="${notice.group}">采用另一版</sl-button><sl-button size="small" variant="text" data-action="keep-both" data-conflict-group="${notice.group}">两版都保留</sl-button></div>
+            </div>
+          </div>`;
+        }).join("")}
+      </div>`);
+  }
+
+  // 术语冲突
+  const termConflicts = conflictNotices.filter((notice) => notice.kind === "term");
+  if (termConflicts.length) {
+    banners.push(`
+      <div class="banner term-banner">
+        <div class="banner-head"><strong>${termConflicts.length} 条术语在其他标签页被修改</strong><span>已采用本标签页的表述，可在术语表中调整</span></div>
+        <ul>${termConflicts.map((notice) => `<li>术语「${escapeHtml(notice.termSource ?? "")}」的${escapeHtml(notice.field)}两边都改了，已保留本标签页版本。</li>`).join("")}</ul>
+        <sl-button size="small" variant="text" data-action="dismiss-conflict" data-dismiss-kind="term">知道了</sl-button>
+      </div>`);
+  }
+
+  // 写入失败、没保住的块
+  if (lastSaveReport && !lastSaveReport.ok) {
+    banners.push(`<div class="banner error-banner"><strong>保存失败：</strong><span>${escapeHtml(lastSaveReport.error ?? "浏览器存储空间不足")}</span></div>`);
+  }
+  if (lastSaveReport?.failedBlocks.length) {
+    const names = lastSaveReport.failedBlocks.map((id) => {
+      const block = project.blocks.find((item) => item.id === id);
+      return block ? block.accessibleText || block.text || id : id;
+    });
+    banners.push(`<div class="banner error-banner"><strong>以下 ${names.length} 个内容块的最新修改没保住：</strong><span>${escapeHtml(names.join("；"))}</span><small>已淘汰旧快照后重试，仍因容量不足失败。请导出备份后清理内容，再重新编辑这些块。</small></div>`);
+  }
+
+  // 淘汰了有引用的版本快照
+  if (lastEvictedVersionLabels.length) {
+    banners.push(`<div class="banner warn-banner"><strong>存储空间不足，已淘汰 ${lastEvictedVersionLabels.length} 个旧版本快照：</strong><span>${escapeHtml(lastEvictedVersionLabels.join("、"))}</span></div>`);
+  }
+
+  return banners.join("");
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
@@ -473,7 +703,7 @@ function render() {
         <div class="brand"><span>无障碍</span><b>1009</b></div>
         <div class="title-block">
           <input id="project-title" aria-label="教材名称" value="${escapeHtml(project.title)}" />
-          <div class="meta"><span>${escapeHtml(project.subject)}</span><span>${escapeHtml(project.grade)}</span><span class="save-dot">本地自动保存</span></div>
+          <div class="meta"><span>${escapeHtml(project.subject)}</span><span>${escapeHtml(project.grade)}</span><span class="save-dot ${saveStatus}">${saveLabel()}</span><span class="revision-pill" title="修订号，多标签页保存时据此合并">修订 ${baseRevision}</span></div>
         </div>
         <div class="top-actions">
           <span class="online-pill">${navigator.onLine ? "在线" : "离线可编辑"}</span>
@@ -495,16 +725,18 @@ function render() {
         </div>
       </div>
 
+      ${renderBanners()}
+
       <div class="workspace">
         <aside class="outline-panel">
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
-              return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
+              return `<button class="block-item ${block.id === active.id ? "active" : ""} ${block.conflict ? "has-conflict" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
-                <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
-                <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
+                <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}${block.conflict ? ` · ${block.conflict.side === "mine" ? "我的冲突版" : "另一标签页版"}` : ""}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
+                ${block.conflict ? `<i class="conflict-flag" title="内容冲突，待挑选两版">!</i>` : `<i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>`}
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
@@ -589,7 +821,7 @@ function render() {
         </aside>
       </div>
 
-      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span></footer>
+      <footer class="statusbar"><span>最近操作：${escapeHtml(document.documentElement.dataset.lastAction || "示例章节已载入")}</span><span>${project.blocks.length} 个内容块 · ${list.length} 个待处理问题</span><span class="storage-usage" title="浏览器本地存储占用（按字符计）">存储 ${Math.round((storageUsage.usedChars / storageUsage.quotaChars) * 100)}% · 快照 ${snapshotIndex.length} 个</span></footer>
     </div>
 
     <sl-dialog label="全书术语表" ${showGlossary ? "open" : ""} data-dialog="glossary">
@@ -643,7 +875,9 @@ function renderPreview() {
 }
 
 function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
-  const oldBlock = version.blocks.find((block) => block.id === current.id);
+  const data = loadSnapshotData(version.id);
+  if (!data) return `<div class="empty-note">该版本快照数据已被淘汰。</div>`;
+  const oldBlock = data.blocks.find((block) => block.id === current.id);
   if (!oldBlock) return `<div class="empty-note">当前内容块不在该版本中。</div>`;
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
 }
@@ -741,13 +975,24 @@ app.addEventListener("click", (event) => {
     commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
   }
   if (action === "save-version") {
-    const versionId = uid("version");
-    commit("保存版本快照", (draft) => {
-      draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) });
-      draft.versions = draft.versions.slice(0, 10);
-    });
-    selectedVersionId = versionId;
+    saveVersionSnapshot();
+  }
+  if (action === "dismiss-conflict") {
+    if (target.dataset.dismissKind === "term") {
+      conflictNotices = conflictNotices.filter((notice) => notice.kind !== "term");
+    } else {
+      conflictNotices = conflictNotices.filter((notice) => notice.group !== target.dataset.conflictGroup);
+    }
     render();
+  }
+  if (action === "keep-mine") {
+    resolveConflict(target.dataset.conflictGroup ?? "", "mine");
+  }
+  if (action === "keep-theirs") {
+    resolveConflict(target.dataset.conflictGroup ?? "", "theirs");
+  }
+  if (action === "keep-both") {
+    clearConflict(target.dataset.conflictGroup ?? "");
   }
   if (action === "approve-all") {
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
@@ -800,6 +1045,17 @@ app.addEventListener("input", (event) => {
 
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
+window.addEventListener("storage", (event) => {
+  if (event.key !== "sologsb-1009-tb::meta") return;
+  window.clearTimeout(mergeTimer);
+  mergeTimer = window.setTimeout(() => mergeFromOtherTab(), 250);
+});
+
+let mergeTimer = 0;
+
+render();
+// 首次使用：把示例章节写入为修订 1
+if (baseRevision === 0 && !readMeta()) saveNow();
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement;
   if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
@@ -811,9 +1067,7 @@ window.addEventListener("keydown", (event) => {
   }
   if (command && event.key.toLowerCase() === "s") {
     event.preventDefault();
-    const versionId = uid("version");
-    commit("键盘保存版本", (draft) => { draft.versions.unshift({ id: versionId, label: `版本 ${draft.versions.length + 1}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) }); });
-    selectedVersionId = versionId;
+    saveVersionSnapshot();
     return;
   }
   if (event.key.toLowerCase() === "j" || event.key.toLowerCase() === "k") {

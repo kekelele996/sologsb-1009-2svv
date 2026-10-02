@@ -170,3 +170,60 @@ sl-textarea::part(textarea) { line-height: 1.65; }
   .workspace { grid-template-columns: 245px minmax(520px, 1fr) 370px; }
   .online-pill { display: none; }
 }
+
+/* 保存状态与修订号 */
+.save-dot { font-variant-numeric: tabular-nums; }
+.save-dot::before {
+  content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 5px; vertical-align: 1px; background: #6b7280;
+}
+.save-dot.saving::before { background: #d08a00; animation: pulse 1s infinite; }
+.save-dot.saved::before { background: #2e7d5b; }
+.save-dot.error { color: #b3261e; font-weight: 700; }
+.save-dot.error::before { background: #b3261e; }
+.revision-pill {
+  font-variant-numeric: tabular-nums; font-size: 10px; color: #5a6a63;
+  background: #eef1ee; border: 1px solid #dfe5e1; border-radius: 99px; padding: 1px 8px;
+}
+@keyframes pulse { 50% { opacity: .35; } }
+
+/* 横幅提示 */
+.banner {
+  margin: 10px 18px 0; padding: 10px 14px; border-radius: 10px;
+  border: 1px solid transparent; display: grid; gap: 8px;
+}
+.banner-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.banner-head span { color: #5a6a63; font-size: 12px; }
+.banner ul { margin: 0; padding-left: 18px; color: #3a4a44; font-size: 12px; }
+.banner small { color: #7a5a56; font-size: 11px; }
+.conflict-banner { background: #fff7e6; border-color: #f0d9a8; }
+.term-banner { background: #eef4ff; border-color: #cdddf5; }
+.error-banner { background: #fdeceb; border-color: #f3c1bd; color: #8a1f1a; }
+.warn-banner { background: #fff4e0; border-color: #ecd0a0; color: #7a5200; }
+
+/* 冲突两版并排 */
+.conflict-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.conflict-version {
+  background: #fff; border: 1px solid #e2d6b8; border-radius: 8px; padding: 8px 10px;
+  display: grid; gap: 6px; align-content: start;
+}
+.conflict-version.theirs { border-color: #cdddf5; }
+.conflict-version header { display: flex; align-items: center; gap: 8px; }
+.conflict-version header span { font-size: 11px; color: #7a6a4a; }
+.conflict-version p { margin: 0; font-size: 13px; line-height: 1.6; color: #2a3a34; }
+.conflict-actions { display: flex; gap: 6px; }
+
+/* 章节列表里的冲突块 */
+.block-item.has-conflict { background: #fff7e6; border-color: #e0c890; }
+.block-item.has-conflict .block-copy b { color: #8a6a1a; }
+.conflict-flag {
+  font-style: normal; font-weight: 800; color: #fff; background: #c8860a;
+  border-radius: 50%; width: 16px; height: 16px; font-size: 11px;
+  display: inline-grid; place-items: center; flex: none;
+}
+
+@media (max-width: 900px) {
+  .conflict-pair { grid-template-columns: 1fr; }
+}
+
+.storage-usage { font-variant-numeric: tabular-nums; }
